@@ -1,0 +1,1241 @@
+-- Script Auto DirtFarm By Nebula Systems (VERSI PERBAIKAN FINAL)
+-- Simpan file ini dengan encoding UTF-8 agar webhook tidak ditolak Discord.
+
+local Mode = "PUTWL" -- PUTWL = TANPA LOCK | ROTASI = VIA ID DOOR
+local IdDoor = "NEBULA" -- Ganti sesuai ID yang ingin dipasang di pintu saat Auto Build
+
+local UsePlatform = true -- true/false
+
+local FileHasil = "DIRTFARM.TXT" -- File daftar target world
+local FileBersih = "DIRTFARM_BERSIH.TXT" -- File daftar world yang sukses
+local WorldStorage = "" -- Tempat buang/ambil barang (Format: NAMA:DOOR)
+local PanjangNama = 5 -- Panjang huruf world buatan bot
+
+local VialStorage = "" -- Tempat ambil penyembuh Brainworms (Format: NAMA:DOOR)
+
+WebhookURL = "" -- Link webhook Discord
+WebhookMessageID = "" -- Kosongkan untuk pesan baru, isi ID untuk fitur live-edit
+IntervalWebhook = 10 -- Jeda pembaruan laporan ke Discord (detik)
+
+local TargetLevel = 5 -- Target level bot sebelum membuat farm
+local BlokLeveling = 2 -- ID blok untuk gb level (2 = Dirt)
+local Sampah = { 4, 5, 10, 11, 15 } -- ID barang yang otomatis dibuang dari tas
+
+local MaxGagal = 3 -- Maksimal gagal masuk world sebelum di-skip
+local JedaUlangDetik = 300 -- Tunggu (detik) sebelum coba world yang gagal tadi
+local VerifyDetik = 5 -- Waktu (detik) memastikan isi tas stabil saat restock
+local MaxRoundCollect = 3 -- Maksimal percobaan ambil barang jika di tas kurang
+local RefreshBersihDtk = 30 -- Seberapa sering bot membaca sinkronisasi data txt
+
+-- Batas waktu anti-macet (BARU)
+local MaxAttemptBersih = 5 -- Maksimal percobaan bersihkan 1 world sebelum dianggap gagal
+local TimeoutLeveling = 1800 -- Maksimal waktu leveling (detik)
+local TimeoutBreakTile = 90 -- Maksimal waktu menghancurkan 1 tile (detik)
+
+local bot = getBot()
+local Folder = "dfarm"
+local Files = {
+    log = "dfarm_log.txt",
+    lock = "dfarm_lock.txt",
+    owner = "dfarm_owner.txt",
+    status = "dfarm_status.txt",
+    hook = "dfarm_hook.txt",
+    msgid = "dfarm_msgid.txt",
+}
+
+local ID_DIRT, ID_MAINDOOR, ID_BEDROCK = 2, 6, 8
+local ID_DOOR, ID_PLATFORM, ID_ENTRANCE, ID_JAMMER = 12, 102, 224, 226
+local ID_SL, ID_BL, ID_HL, ID_WL, ID_FIRSTLOCK = 202, 204, 206, 242, 9640
+local KodeNone, KodeBrainworms, KodeGrumbleteeth = 0, 2, 4
+
+-- Blok pengisi tile (1,2) setelah lock dihancurkan
+local FillId = UsePlatform and ID_PLATFORM or ID_DIRT
+
+local LockIDs = { [ID_SL] = true, [ID_BL] = true, [ID_HL] = true, [ID_WL] = true, [ID_FIRSTLOCK] = true }
+local Unbreakable = { [ID_MAINDOOR] = true, [ID_BEDROCK] = true, [ID_JAMMER] = true, [ID_ENTRANCE] = true }
+local Passable = { [ID_MAINDOOR] = true, [ID_DOOR] = true, [ID_ENTRANCE] = true }
+
+local ItemKuota = {
+    [ID_WL] = { 1, 1 },
+    [ID_DOOR] = { 1, 1 },
+    [ID_ENTRANCE] = { 2, 2 },
+    [ID_JAMMER] = { 1, 1 },
+    [ID_SL] = { 2, 2 },
+    [ID_PLATFORM] = UsePlatform and { 55, 70 } or { 0, 0 },
+    [ID_DIRT] = { 5, 5 },
+}
+
+local MaladySettings = {
+    enabled = true,
+    auto_refresh = true,
+    auto_grumbleteeth = true,
+    use_home = true,
+    auto_vial = true,
+    vial = KodeBrainworms,
+    storage = VialStorage,
+}
+
+local Offsets = {
+    {-1, 0}, {1, 0}, {0, 1}, {0, -1}, {-1, 1}, {1, 1},
+    {-1, -1}, {1, -1}, {0, 2}, {0, -2}, {-2, 0}, {2, 0},
+}
+
+local PrevStatus, LastWebhookTime, ExpectedWorld = {}, 0, ""
+local BuildBlocked, BuildState = true, nil
+local WebhookBusy, WebhookFailCount = false, 0
+local LastLevel = nil
+
+-- ============================================================
+-- FUNGSI DASAR
+-- ============================================================
+
+local function Try(fn)
+    local ok, value = pcall(fn)
+    if ok then return value end
+end
+
+-- Diisi setelah CheckWebhook dibuat. Dipanggil setiap Sleep supaya
+-- webhook tetap terkirim walaupun bot sedang berada di dalam loop panjang.
+local WebhookTick = nil
+
+local function Sleep(a, b)
+    sleep(math.random(a, b or a))
+    if WebhookTick then WebhookTick() end
+end
+
+local function InBounds(x, y)
+    return x >= 0 and x <= 99 and y >= 0 and y <= 59
+end
+
+local function Count(id)
+    return Try(function() return getInventory():getItemCount(id) end) or 0
+end
+
+local function CurrentWorld()
+    return string.upper(tostring(Try(function() return getWorld().name end) or ""))
+end
+
+local function GetTile(x, y)
+    local t = getTile(x, y)
+    return t and t.fg or -1
+end
+
+local function Pos()
+    local me = getLocal()
+    if not me then return 0, 0 end
+    return math.floor(me.posx / 32), math.floor(me.posy / 32)
+end
+
+local function OnTile(x, y)
+    local bx, by = Pos()
+    return bx == x and by == y
+end
+
+local function Near(x, y)
+    local bx, by = Pos()
+    return math.abs(bx - x) <= 2 and math.abs(by - y) <= 2
+end
+
+-- Jika level tidak terbaca, pakai nilai terakhir (atau anggap cukup)
+-- supaya bot tidak terjebak selamanya di leveling.
+local function GetLevel()
+    local lvl = Try(function() return bot.level end)
+    if type(lvl) == "number" then
+        LastLevel = lvl
+        return lvl
+    end
+    return LastLevel or TargetLevel
+end
+
+local function SetBuild(build, on)
+    if build then
+        pcall(function() build.enabled = on end)
+        BuildState = on
+    end
+end
+
+local function CleanJunk()
+    for _, id in ipairs(Sampah) do
+        local n = Count(id)
+        if n > 0 then pcall(function() bot:trash(id, n) end) end
+    end
+end
+
+-- ============================================================
+-- FILE & FOLDER
+-- ============================================================
+
+local function RunCommand(cmd)
+    if not pcall(function() os.execute(cmd) end) then
+        pcall(function()
+            local p = io.popen(cmd)
+            if p then p:read("a"); p:close() end
+        end)
+    end
+end
+
+local function SetupInternalFiles()
+    RunCommand('mkdir "' .. Folder .. '" 2>nul')
+    RunCommand('attrib +h "' .. Folder .. '"')
+    local test = io.open(Folder .. "/log.txt", "a")
+    if test then
+        test:close()
+        for key in pairs(Files) do
+            Files[key] = Folder .. "/" .. key .. ".txt"
+        end
+    end
+end
+
+local function EachLine(path, fn)
+    local f = io.open(path, "r")
+    if f then
+        for line in f:lines() do fn(line) end
+        f:close()
+    end
+end
+
+local function AppendLine(path, text)
+    local f = io.open(path, "a")
+    if not f then return false end
+    f:write(text .. "\n")
+    f:close()
+    return true
+end
+
+local function WriteLines(path, lines)
+    local f = io.open(path, "w")
+    if not f then return false end
+    for _, line in ipairs(lines) do f:write(line .. "\n") end
+    f:close()
+    return true
+end
+
+-- ============================================================
+-- LOCK ANTAR BOT
+-- ============================================================
+
+local function ReadLock()
+    local owner, stamp
+    EachLine(Files.lock, function(line)
+        if not owner then owner = line
+        elseif not stamp then stamp = tonumber(line) end
+    end)
+    return (owner ~= "" and owner or nil), stamp
+end
+
+local function AcquireLock(me)
+    local limit = os.time() + 15
+    while os.time() < limit do
+        local owner, stamp = ReadLock()
+        if owner == nil or stamp == nil or os.time() - stamp > 10 then
+            WriteLines(Files.lock, { me, tostring(os.time()) })
+            Sleep(100, 250)
+            if ReadLock() == me then return true end
+        end
+        Sleep(150, 400)
+    end
+    return false
+end
+
+local MyNameCache = nil
+
+local function GetMyName()
+    if not MyNameCache then
+        local name = Try(function() return getLocal().name end) or Try(function() return bot.name end)
+        if type(name) == "string" and name ~= "" then MyNameCache = name end
+    end
+    return MyNameCache or "bot"
+end
+
+local function WithLock(fn)
+    local me = GetMyName()
+    if not AcquireLock(me) then return false end
+    local ok, result = pcall(fn)
+    if ReadLock() == me then WriteLines(Files.lock, {}) end
+    return ok and result
+end
+
+-- ============================================================
+-- MALADY
+-- ============================================================
+
+local function EnableMalady()
+    local mal = bot.auto_malady
+    if mal then
+        for key, value in pairs(MaladySettings) do
+            pcall(function() mal[key] = value end)
+        end
+    end
+end
+
+local function IsMaladyNone()
+    if Try(function() return bot.malady end) == KodeNone then return true end
+    local d = Try(function() return bot:getMaladyDuration() end)
+    return type(d) == "number" and d <= 0
+end
+
+local function MaladyName(code)
+    if code == KodeNone then return "None" end
+    if code == KodeBrainworms then return "Brainworms" end
+    if code == KodeGrumbleteeth then return "Grumbleteeth" end
+    return "Malady " .. tostring(code)
+end
+
+local function WaitOnline()
+    local waited = false
+    while bot.status ~= BotStatus.online do
+        waited = true
+        Sleep(3000, 5000)
+    end
+    if waited then Sleep(2000, 3000) end
+end
+
+local function CurrentWorldIs(name)
+    return CurrentWorld() == name
+end
+
+local function StillHere()
+    return ExpectedWorld == "" or CurrentWorldIs(ExpectedWorld)
+end
+
+local function WaitCalm(seconds)
+    local last, calm, limit = CurrentWorld(), 0, os.time() + 120
+    while calm < seconds and os.time() < limit do
+        WaitOnline()
+        Sleep(1000)
+        local now = CurrentWorld()
+        if now == last then
+            calm = calm + 1
+        else
+            last, calm = now, 0
+        end
+    end
+end
+
+-- ============================================================
+-- INDEKS BOT & LEADER
+-- ============================================================
+
+local function GetMyIndex()
+    local myIdx = 1
+    pcall(function()
+        for idx, b in pairs(getBots() or {}) do
+            if b.name == bot.name then myIdx = idx; break end
+        end
+    end)
+    return myIdx
+end
+
+local function IsLeader()
+    local myIdx, leader = tonumber(GetMyIndex()) or 1, nil
+    pcall(function()
+        for idx, b in pairs(getBots() or {}) do
+            local n = tonumber(idx)
+            if n and b.status == BotStatus.online and (leader == nil or n < leader) then
+                leader = n
+            end
+        end
+    end)
+    return leader == nil or leader == myIdx
+end
+
+-- ============================================================
+-- RIWAYAT & STATUS
+-- ============================================================
+
+local function AddHistory(msg)
+    AppendLine(Files.log, string.format("`%s` %s", os.date("%H:%M"), msg))
+end
+
+local function ReadHistory(n)
+    local lines = {}
+    EachLine(Files.log, function(line)
+        if line ~= "" then table.insert(lines, line) end
+    end)
+    if #lines > 300 then
+        local keep = {}
+        for i = #lines - 29, #lines do table.insert(keep, lines[i]) end
+        WriteLines(Files.log, keep)
+    end
+    local result = {}
+    for i = #lines, math.max(1, #lines - n + 1), -1 do
+        table.insert(result, lines[i])
+    end
+    return result
+end
+
+local function StatusText(st)
+    if st == BotStatus.online then return "Online" end
+    if st == BotStatus.offline then return "Offline" end
+    return tostring(st)
+end
+
+local function UpdateStatus()
+    pcall(function()
+        local changed = false
+        for idx, b in pairs(getBots() or {}) do
+            local key, st = tostring(idx), b.status
+            if PrevStatus[key] ~= st then
+                if PrevStatus[key] ~= nil then
+                    AddHistory(string.format(
+                        "**Bot %s**: `%s` -> `%s`",
+                        key, StatusText(PrevStatus[key]), StatusText(st)
+                    ))
+                end
+                PrevStatus[key], changed = st, true
+            end
+        end
+        if changed then
+            local lines = {}
+            for key, st in pairs(PrevStatus) do
+                table.insert(lines, key .. "|" .. tostring(st))
+            end
+            WriteLines(Files.status, lines)
+        end
+    end)
+end
+
+local function LoadStatusFile()
+    local t = {}
+    EachLine(Files.status, function(line)
+        local key, st = string.match(line, "^([^|]+)|(%-?%d+)$")
+        if key then t[key] = tonumber(st) end
+    end)
+    return t
+end
+
+-- ============================================================
+-- DAFTAR WORLD
+-- ============================================================
+
+local function ParseEntry(line)
+    local clean = string.gsub(line, "%s+", "")
+    local name, door = string.match(clean, "^([^:|]+)[:|]?(.*)$")
+    if name and name ~= "" then return string.upper(name), door end
+end
+
+local function LoadWorldSet(path)
+    local set = {}
+    EachLine(path, function(line)
+        local name, door = ParseEntry(line)
+        if name then set[name] = door end
+    end)
+    return set
+end
+
+local function CountSet(set)
+    local n = 0
+    for _ in pairs(set) do n = n + 1 end
+    return n
+end
+
+local function SweepDirtfarm()
+    return WithLock(function()
+        local bersih, keep, removed = LoadWorldSet(FileBersih), {}, 0
+        EachLine(FileHasil, function(line)
+            local name = ParseEntry(line)
+            if name and bersih[name] ~= nil then
+                removed = removed + 1
+            elseif name then
+                table.insert(keep, line)
+            end
+        end)
+        if removed == 0 then return true end
+        print(string.format("[RESET] %d world dihapus dari %s", removed, FileHasil))
+        return WriteLines(FileHasil, keep)
+    end)
+end
+
+local function LoadOwners()
+    local owners = {}
+    EachLine(Files.owner, function(line)
+        local world, owner = string.match(line, "^([^|]+)|(.+)$")
+        if world then owners[string.upper(world)] = owner end
+    end)
+    return owners
+end
+
+local function AppendOwner(world, owner)
+    return AppendLine(Files.owner, world .. "|" .. owner)
+end
+
+-- ============================================================
+-- WEBHOOK DISCORD
+-- ============================================================
+
+local function escapeJson(str)
+    if not str then return "" end
+    str = tostring(str)
+    str = str:gsub("\\", "\\\\")
+    str = str:gsub('"', '\\"')
+    str = str:gsub("\n", "\\n")
+    str = str:gsub("\r", "\\r")
+    -- karakter kontrol lain (tab dsb.) harus di-escape agar JSON valid
+    str = str:gsub("%c", function(c) return string.format("\\u%04x", string.byte(c)) end)
+    -- buang byte non-ASCII yang rusak (penyebab utama Discord menolak dengan 400)
+    str = str:gsub("[\128-\255]", "")
+    return str
+end
+
+local function kirimWebhook(metode, url, payload)
+    local status, body = nil, nil
+    local ok, err = pcall(function()
+        local client = HttpClient.new()
+        client.url = url
+        client.method = metode
+        client.content = payload
+        client.headers["Content-Type"] = "application/json; charset=utf-8"
+        local hasil = client:request()
+        if hasil then
+            status = hasil.status
+            body = hasil.body
+        end
+    end)
+    if not ok then print("[WEBHOOK] Error HTTP: " .. tostring(err)) end
+    return status, body
+end
+
+local function ReadHookStamp()
+    local stamp = 0
+    EachLine(Files.hook, function(line) stamp = tonumber(line) or stamp end)
+    return stamp
+end
+
+local function LoadMessageId()
+    EachLine(Files.msgid, function(line)
+        local id = string.match(line, "%d+")
+        if id then WebhookMessageID = id end
+    end)
+end
+
+-- Mengembalikan true jika berhasil, atau false + kode status jika gagal.
+local function DeliverWebhook(payload)
+    local status
+
+    if WebhookMessageID ~= "" then
+        status = kirimWebhook(Method.patch, WebhookURL .. "/messages/" .. WebhookMessageID, payload)
+        if status == 200 then return true end
+        if status ~= 404 then return false, status end
+        WebhookMessageID = "" -- pesan lama sudah tidak ada, buat pesan baru
+    end
+
+    local body
+    status, body = kirimWebhook(Method.post, WebhookURL .. "?wait=true", payload)
+    if status == 200 or status == 204 then
+        -- simpan ID pesan supaya laporan berikutnya meng-edit pesan yang sama
+        local id = type(body) == "string" and string.match(body, '"id"%s*:%s*"(%d+)"')
+        if id then
+            WebhookMessageID = id
+            WriteLines(Files.msgid, { id })
+        end
+        return true
+    end
+    return false, status
+end
+
+local function BuildHistoryText()
+    local history = ReadHistory(5)
+    if #history == 0 then return "+- System Idle / Stabil" end
+
+    local text = ""
+    for i, log in ipairs(history) do
+        text = text .. "+- " .. log
+        if i < #history then text = text .. "\n" end
+    end
+    return text
+end
+
+local function SendWebhook(note)
+    if WebhookURL == "" or WebhookBusy then return end
+    WebhookBusy = true
+
+    local ok, err = pcall(function()
+        UpdateStatus()
+
+        local online, total = 0, 0
+        for _, b in pairs(getBots() or {}) do
+            total = total + 1
+            if b.status == BotStatus.online then online = online + 1 end
+        end
+
+        local bersih = LoadWorldSet(FileBersih)
+
+        local rawDesc = string.format(
+            "<a:bot:1563229171369648128> **AUTO DIRTFARM** <a:bot:1563229171369648128>\n" ..
+            "<a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116>\n" ..
+            "<a:status:1546769828646363146> **Up Time**  : <t:%d:R>\n\n" ..
+            "<a:bluearrow:1561006242128863265> **Status Bot**\n" ..
+            "<a:online:1561273204163477545> Online : %d/%d\n" ..
+            "<a:offline:1561273257343189022> Offline : %d\n\n" ..
+            "<a:bluearrow:1561006242128863265> **Total DirtFarm**\n" ..
+            "<:dirt:1479611103825629194> DirtFarm : %d\n" ..
+            "<a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116> <a:gariscihuy:1216416507836502116>\n" ..
+            "%s<a:history:1566756900006268960>  **RIWAYAT AKTIVITAS**\n%s",
+            os.time(), online, total, (total - online), CountSet(bersih),
+            note and ("[!] **SYSTEM ALERT**\n" .. note .. "\n\n") or "",
+            BuildHistoryText()
+        )
+
+        local color = note and 15158332 or 3066993
+        local payload = string.format(
+            '{"username": "Nebula Systems", "embeds": [{"description": "%s", "color": %d, "footer": {"text": "Nebula Systems - Auto DirtFarm"}}]}',
+            escapeJson(rawDesc), color
+        )
+
+        local sent, status = DeliverWebhook(payload)
+        if sent then
+            WebhookFailCount = 0
+        else
+            WebhookFailCount = WebhookFailCount + 1
+            print(string.format("[WEBHOOK] Gagal kirim (status: %s, gagal ke-%d)", tostring(status), WebhookFailCount))
+        end
+
+        LastWebhookTime = os.time()
+        WriteLines(Files.hook, { tostring(os.time()) })
+    end)
+
+    WebhookBusy = false
+    if not ok then
+        LastWebhookTime = os.time()
+        WebhookFailCount = WebhookFailCount + 1
+        print("[WEBHOOK] Error: " .. tostring(err))
+    end
+end
+
+-- Semua bot boleh mengirim, tapi dibatasi lewat file bersama (dfarm_hook.txt)
+-- agar tidak double. Tidak lagi bergantung pada "leader" yang bisa saja macet.
+local function CheckWebhook()
+    if WebhookURL == "" or WebhookBusy then return end
+
+    -- jika sering gagal, perlambat otomatis (maks 6x) agar tidak kena rate-limit
+    local interval = IntervalWebhook * (1 + math.min(WebhookFailCount, 5))
+    if os.time() - LastWebhookTime < interval then return end
+
+    LastWebhookTime = os.time()
+    if os.time() - ReadHookStamp() < interval - 1 then return end
+
+    SendWebhook()
+end
+
+WebhookTick = CheckWebhook
+
+-- ============================================================
+-- MOVEMENT & TILE
+-- ============================================================
+
+local function HandOverToMalady(build)
+    if not IsMaladyNone() then return false end
+
+    SetBuild(build, false)
+    pcall(function() bot.auto_collect = false end)
+
+    while IsMaladyNone() do
+        EnableMalady()
+        CheckWebhook()
+        WaitOnline()
+        Sleep(2000, 3000)
+    end
+
+    WaitCalm(10)
+    SetBuild(build, not BuildBlocked)
+    return true
+end
+
+local function WarpTo(worldName)
+    local target = string.upper(string.match(worldName, "^([^|:]+)") or worldName)
+    for _ = 1, 3 do
+        WaitOnline()
+        pcall(function() bot:warp(worldName) end)
+        Sleep(5000, 6000)
+        if CurrentWorld() == target then return true end
+    end
+    return false
+end
+
+local function Approach(x, y)
+    if Near(x, y) and not OnTile(x, y) then return true end
+
+    local cands = {}
+    for _, o in ipairs(Offsets) do
+        local sx, sy = x + o[1], y + o[2]
+        if InBounds(sx, sy) then
+            local fg = GetTile(sx, sy)
+            if fg <= 0 or Passable[fg] then table.insert(cands, { sx, sy }) end
+        end
+    end
+
+    for _, c in ipairs(cands) do
+        pcall(function() bot:findPath(c[1], c[2]) end)
+        Sleep(120, 150)
+        if Near(x, y) and not OnTile(x, y) then return true end
+    end
+    return false
+end
+
+local function StandAt(sx, sy)
+    for _ = 1, 3 do
+        if OnTile(sx, sy) then return true end
+        pcall(function() bot:findPath(sx, sy) end)
+        Sleep(300, 500)
+    end
+    return OnTile(sx, sy)
+end
+
+-- PERBAIKAN: sekarang ada batas waktu, sehingga lock yang tidak bisa
+-- dijangkau tidak membuat bot menunggu selamanya.
+local function BreakTile(x, y)
+    if not InBounds(x, y) then return false end
+
+    local persistent = LockIDs[GetTile(x, y)] == true
+    local hits = 0
+    local deadline = os.time() + TimeoutBreakTile
+
+    while os.time() < deadline do
+        if not StillHere() then return false end
+
+        local fg = GetTile(x, y)
+        if fg <= 0 then return true end
+        if Unbreakable[fg] or (not persistent and hits >= 40) then return false end
+
+        WaitOnline()
+        if Approach(x, y) then
+            bot:hit(x, y)
+            hits = hits + 1
+            Sleep(120, 140)
+        else
+            Sleep(1000, 2000)
+        end
+    end
+    return false
+end
+
+local function PlaceAt(x, y, id)
+    if not InBounds(x, y) or not StillHere() or GetTile(x, y) ~= 0 or Count(id) < 1 then
+        return false
+    end
+    WaitOnline()
+    if not Approach(x, y) then return false end
+    bot:place(x, y, id)
+    Sleep(200, 300)
+    return GetTile(x, y) == id
+end
+
+local function FindDoor()
+    for y = 0, 59 do
+        for x = 0, 99 do
+            if GetTile(x, y) == ID_MAINDOOR then return x, y end
+        end
+    end
+end
+
+local function LockTiles()
+    local list = {}
+    for y = 0, 59 do
+        for x = 0, 99 do
+            if LockIDs[GetTile(x, y)] then table.insert(list, { x, y }) end
+        end
+    end
+    return list
+end
+
+local function ClearDoorArea(dx, dy)
+    if dx and LockIDs[GetTile(dx, dy - 1)] then BreakTile(dx, dy - 1) end
+    BreakTile(0, 2)
+    StandAt(0, 2)
+    -- Jangan pecahkan blok pengisi yang sudah terpasang (Dirt/Platform)
+    if GetTile(1, 2) ~= FillId then BreakTile(1, 2) end
+    for _ = 1, 5 do
+        if GetTile(1, 2) ~= 0 then break end
+        StandAt(0, 2)
+        PlaceAt(1, 2, FillId)
+        Sleep(300, 500)
+    end
+end
+
+local function BreakSmallLock()
+    Sleep(1500, 2000) -- Beri jeda agar server me-render blok sepenuhnya
+    StandAt(0, 2)
+    
+    local fg = GetTile(1, 2)
+    -- Memakai LockIDs agar mendeteksi SL, BL, HL, maupun WL
+    if LockIDs[fg] then 
+        BreakTile(1, 2)
+    -- Jika bukan lock standar tapi ada barang yang menghalangi, paksa pukul!
+    elseif fg > 0 and fg ~= FillId then
+        BreakTile(1, 2)
+    end
+    
+    -- Pasang platform
+    for _ = 1, 5 do
+        if GetTile(1, 2) ~= 0 then break end
+        StandAt(0, 2)
+        PlaceAt(1, 2, FillId)
+        Sleep(300, 500)
+    end
+end
+
+-- ============================================================
+-- VERIFIKASI & PEMBERSIHAN WORLD
+-- ============================================================
+
+local function VerifyWorld(target)
+    if CurrentWorld() ~= target then
+        return false, "bot tidak berada di world target"
+    end
+
+    if Mode == "ROTASI" then
+        local fg = GetTile(1, 2)
+        -- Ubah verifikasi agar mengecek segala jenis lock, bukan hanya SL
+        if LockIDs[fg] then return false, "lock di (1,2) belum hancur" end
+        if fg <= 0 then return false, string.format("(1,2) belum terisi platform (tile=%d)", fg) end
+        return true, "ok"
+    end
+
+    local locks = LockTiles()
+    if #locks > 0 then
+        return false, string.format("masih ada lock di (%d,%d)", locks[1][1], locks[1][2])
+    end
+
+    local fgPlat = GetTile(1, 2)
+    if fgPlat <= 0 then
+        return false, string.format("(1,2) belum terisi platform (tile=%d)", fgPlat)
+    end
+
+    return true, "ok"
+end
+
+-- Return: (berhasil, terputus)
+-- PERBAIKAN: sebelumnya loop ini tanpa batas. Kini maksimal MaxAttemptBersih
+-- percobaan, lalu dianggap gagal agar counter MaxGagal/JedaUlang bekerja.
+local function CleanWithVerify(target, door)
+    local warpStr = (door and door ~= "") and (target .. "|" .. door) or target
+    local attempt, warpFails = 0, 0
+
+    while true do
+        attempt = attempt + 1
+        WaitOnline()
+        HandOverToMalady(nil)
+        ExpectedWorld = ""
+
+        local inWorld = CurrentWorld() == target
+            or WarpTo(warpStr)
+            or (warpStr ~= target and WarpTo(target))
+
+        if not inWorld then
+            warpFails = warpFails + 1
+            if warpFails >= 3 then return false, false end
+        else
+            warpFails, ExpectedWorld = 0, target
+
+            if Mode == "ROTASI" then
+                BreakSmallLock()
+            else
+                local dx, dy = FindDoor()
+                ClearDoorArea(dx, dy)
+                for _, p in ipairs(LockTiles()) do BreakTile(p[1], p[2]) end
+            end
+
+            CleanJunk()
+
+            if StillHere() then
+                local ok1 = VerifyWorld(target)
+                if ok1 then
+                    Sleep(2000, 3000)
+                    local ok2 = VerifyWorld(target)
+                    if ok2 then
+                        ExpectedWorld = ""
+                        return true, false
+                    end
+                end
+            end
+
+            if not StillHere() then
+                ExpectedWorld = ""
+                return false, true
+            end
+        end
+
+        if attempt >= MaxAttemptBersih then
+            ExpectedWorld = ""
+            return false, false
+        end
+        Sleep(1500, 2500)
+    end
+end
+
+-- ============================================================
+-- INVENTORY & STORAGE
+-- ============================================================
+
+local function MissingItem()
+    for id, quota in pairs(ItemKuota) do
+        if Count(id) < quota[1] then return id end
+    end
+end
+
+local function DropSurplus(storageName)
+    if CurrentWorld() ~= storageName then return end
+    for id, quota in pairs(ItemKuota) do
+        local extra = Count(id) - quota[2]
+        if extra > 0 then
+            pcall(function() bot:drop(id, extra) end)
+            Sleep(800, 1200)
+            if Count(id) > quota[2] then
+                pcall(function() bot:fastDrop(id, extra) end)
+                Sleep(800, 1200)
+            end
+        end
+    end
+end
+
+local function CollectAndVerify(storageName)
+    for _ = 1, MaxRoundCollect do
+        local missing = MissingItem()
+        if missing then
+            pcall(function() bot.auto_collect = true end)
+            Sleep(1000)
+            pcall(function() bot.auto_collect = false end)
+            Sleep(500, 800)
+        end
+
+        DropSurplus(storageName)
+
+        local stable = true
+        for _ = 1, VerifyDetik do
+            Sleep(1000)
+            if MissingItem() then stable = false; break end
+        end
+        if stable then return true end
+    end
+    return false
+end
+
+local function RestockAtStorage(storageName)
+    if not WarpTo((string.gsub(WorldStorage, ":", "|"))) then WarpTo(storageName) end
+    Sleep(1000, 2000)
+    return CollectAndVerify(storageName)
+end
+
+-- ============================================================
+-- LEVELING
+-- ============================================================
+
+local function IsProtected(fg)
+    return fg > 0 and (Unbreakable[fg] or LockIDs[fg]) and true or false
+end
+
+local function SetupHomeWorld()
+    local hasFirst = false
+    for _, p in ipairs(LockTiles()) do
+        if GetTile(p[1], p[2]) == ID_FIRSTLOCK then hasFirst = true end
+    end
+    if not hasFirst then return nil end
+
+    local name = CurrentWorld()
+    pcall(function() bot.home_world = name end)
+    return name
+end
+
+local function HasWork(x, y)
+    local t = getTile(x, y)
+    if not t then return false end
+    if t.fg > 0 then return not IsProtected(t.fg) end
+    return t.bg > 0
+end
+
+local function ClearForXP(x, y)
+    for _ = 1, 60 do
+        if not HasWork(x, y) or not Approach(x, y) then return end
+        bot:hit(x, y)
+        Sleep(115, 135)
+    end
+end
+
+-- PERBAIKAN: ada batas waktu (TimeoutLeveling) agar bot tidak terjebak
+-- selamanya jika level tidak naik / blok leveling habis.
+local function RunLeveling(levelWorld)
+    pcall(function() bot.auto_collect = true end)
+
+    local tiles = 0
+    local deadline = os.time() + TimeoutLeveling
+
+    local function Finished()
+        return GetLevel() >= TargetLevel or os.time() > deadline
+    end
+
+    local function Housekeep()
+        WaitOnline()
+        HandOverToMalady(nil)
+        if tiles % 20 == 0 then
+            EnableMalady()
+            CleanJunk()
+        end
+        if levelWorld ~= nil and CurrentWorld() ~= levelWorld then
+            pcall(function() bot.auto_collect = false end)
+            WarpTo(levelWorld)
+            pcall(function() bot.auto_collect = true end)
+        end
+    end
+
+    local rightToLeft, done = true, false
+    for y = 0, 59 do
+        if done then break end
+
+        local hasWork = false
+        for x = 0, 99 do
+            if HasWork(x, y) then hasWork = true; break end
+        end
+
+        if hasWork then
+            local first, last, step = 99, 0, -1
+            if not rightToLeft then first, last, step = 0, 99, 1 end
+
+            for x = first, last, step do
+                tiles = tiles + 1
+                if Finished() then done = true; break end
+                Housekeep()
+                if HasWork(x, y) then ClearForXP(x, y) end
+            end
+            rightToLeft = not rightToLeft
+        end
+    end
+
+    while not Finished() do
+        tiles = tiles + 1
+        Housekeep()
+
+        local bx, by = Pos()
+        local tx = IsProtected(GetTile(bx + 1, by)) and bx - 1 or bx + 1
+        if InBounds(tx, by) and not IsProtected(GetTile(tx, by)) and Count(BlokLeveling) > 0 then
+            if GetTile(tx, by) == 0 then
+                bot:place(tx, by, BlokLeveling)
+                Sleep(85, 105)
+            end
+            if GetTile(tx, by) > 0 then bot:hit(tx, by) end
+        end
+        Sleep(115, 135)
+    end
+
+    if GetLevel() < TargetLevel then
+        AddHistory("Leveling timeout, lanjut tanpa mencapai target level")
+    end
+    pcall(function() bot.auto_collect = false end)
+end
+
+-- ============================================================
+-- AUTO BUILD
+-- ============================================================
+
+local function ApplyDoorId(build)
+    -- Jika IdDoor masih "0", biarkan kosong/acak dari executor
+    if IdDoor == "0" then return end 
+    
+    -- Langsung tembak ke properti executor yang sudah terkonfirmasi
+    pcall(function() build.custom_id = tostring(IdDoor) end)
+end
+
+local function ApplyBuildConfig(build)
+    local settings = {
+        { "enabled", false }, { "soil_mode", false }, { "insert_rotation", true },
+        { "ignore_lava", false }, { "ignore_cave", false }, { "build_water", false },
+        { "build_plat", UsePlatform }, { "use_fire_house", false }, { "item_storage", WorldStorage },
+        { "soil_storage", "" }, { "output_path", FileHasil }, { "name_length", PanjangNama },
+        { "door_id", 12 }, { "entrance_id", 224 }, { "platform_id", 102 },
+        { "no_number", true }, -- MENAMBAHKAN FITUR PENCARIAN WORLD TANPA ANGKA
+    }
+    for _, s in ipairs(settings) do
+        pcall(function() build[s[1]] = s[2] end)
+    end
+end
+
+-- ============================================================
+-- PROGRAM UTAMA
+-- ============================================================
+
+local function Main()
+    SetupInternalFiles()
+    if Mode ~= "PUTWL" and Mode ~= "ROTASI" then Mode = "PUTWL" end
+
+    PrevStatus = LoadStatusFile()
+    LoadMessageId()
+    print("[START] Auto DirtFarm berjalan.")
+
+    WaitOnline()
+    Sleep(math.min(tonumber(GetMyIndex()) or 1, 30) * 300)
+
+    pcall(function()
+        bot.anti_fire = true
+        bot.anti_toxic = true
+        bot.auto_trash = false
+    end)
+
+    local levelWorld = SetupHomeWorld()
+    EnableMalady()
+    HandOverToMalady(nil)
+
+    if GetLevel() < TargetLevel then RunLeveling(levelWorld) end
+
+    local build = bot.auto_build
+    if not build then
+        print("[ERROR] bot.auto_build tidak tersedia, cek versi Lucifer / pengaturan bot.")
+        return
+    end
+
+    ApplyBuildConfig(build)
+    ApplyDoorId(build)
+    pcall(function() bot.auto_collect = false end)
+    SetBuild(build, false)
+
+    local me = GetMyName()
+    local storageName = string.upper(string.match(WorldStorage, "^([^|:]+)") or WorldStorage)
+    local cleaned = LoadWorldSet(FileBersih)
+    local owners = LoadOwners()
+    local lastRefresh, lastRestock = os.time(), 0
+    local myWorlds, fails, retryAt = {}, {}, {}
+
+    for world, owner in pairs(owners) do
+        if owner == me and not cleaned[world] then myWorlds[world] = true end
+    end
+
+    local function MarkCurrentWorld()
+        local cur = CurrentWorld()
+        if cur ~= "" and cur ~= "EXIT" and cur ~= storageName and not cleaned[cur] and not myWorlds[cur] then
+            myWorlds[cur], owners[cur] = true, me
+            AppendOwner(cur, me)
+        end
+    end
+
+    SweepDirtfarm()
+
+    local function Step()
+        WaitOnline()
+        EnableMalady()
+        HandOverToMalady(build)
+        CheckWebhook()
+        MarkCurrentWorld()
+
+        if os.time() - lastRefresh >= RefreshBersihDtk then
+            cleaned, owners, lastRefresh = LoadWorldSet(FileBersih), LoadOwners(), os.time()
+            if IsLeader() then SweepDirtfarm() end
+        end
+
+        local recorded = LoadWorldSet(FileHasil)
+
+        -- PERBAIKAN: world yang sedang masa tunggu (cooldown) tidak lagi
+        -- menahan auto build, sehingga bot tidak diam 5 menit penuh.
+        local pendingMine = 0
+        for w in pairs(myWorlds) do
+            if recorded[w] and not cleaned[w] and (retryAt[w] or 0) <= os.time() then
+                pendingMine = pendingMine + 1
+            end
+        end
+
+        BuildBlocked = pendingMine > 0
+        if BuildBlocked and BuildState ~= false then
+            SetBuild(build, false)
+        elseif not BuildBlocked and BuildState ~= true then
+            SetBuild(build, true)
+        end
+
+        local target = nil
+        for w in pairs(myWorlds) do
+            if recorded[w] and not cleaned[w] and (retryAt[w] or 0) <= os.time() then
+                target = w
+                break
+            end
+        end
+
+        if not target then
+            for _ = 1, 4 do
+                Sleep(400, 600)
+                MarkCurrentWorld()
+            end
+            return
+        end
+
+        SetBuild(build, false)
+        Sleep(1500, 2000)
+
+        -- Blok pengisi (1,2) habis: restock paksa, abaikan jeda 120 detik
+        local fillEmpty = Count(FillId) < 1
+        if fillEmpty or (MissingItem() and os.time() - lastRestock > 120) then
+            lastRestock = os.time()
+            RestockAtStorage(storageName)
+        end
+
+        -- Masih kosong setelah restock (stok storage habis): jangan buang percobaan,
+        -- tunda world ini, kirim peringatan, dan coba lagi setelah jeda.
+        if Count(FillId) < 1 then
+            retryAt[target] = os.time() + JedaUlangDetik
+            AddHistory(string.format("Bot %s: blok pengisi (id %d) habis, %s ditunda",
+                tostring(GetMyIndex()), FillId, target))
+            SendWebhook("Blok pengisi (1,2) habis di tas dan storage")
+            return
+        end
+
+        local ok, interrupted = CleanWithVerify(target, recorded[target])
+
+        if interrupted then
+            if not HandOverToMalady(build) then WaitCalm(10) end
+            return
+        end
+
+        if ok then
+            cleaned[target], myWorlds[target], fails[target] = true, nil, nil
+            
+            -- Menyesuaikan format teks yang akan disimpan
+            local teksSimpan = target
+            if Mode == "ROTASI" then
+                local doorTarget = recorded[target]
+                if doorTarget and doorTarget ~= "" then
+                    teksSimpan = target .. ":" .. doorTarget
+                else
+                    teksSimpan = target .. ":" .. IdDoor
+                end
+            end
+            
+            if AppendLine(FileBersih, teksSimpan) and LoadWorldSet(FileBersih)[target] ~= nil then
+                SweepDirtfarm()
+            end
+            AddHistory(string.format("Bot %s: Lolos inspeksi final", tostring(GetMyIndex())))
+        else
+            fails[target] = (fails[target] or 0) + 1
+            AddHistory(string.format("Bot %s: gagal bersihkan %s (%d/%d)",
+                tostring(GetMyIndex()), target, fails[target], MaxGagal))
+            if fails[target] >= MaxGagal then
+                fails[target] = 0
+                retryAt[target] = os.time() + JedaUlangDetik
+            end
+        end
+
+        SendWebhook()
+        if not RestockAtStorage(storageName) then SendWebhook("Item tas belum sesuai kuota") end
+    end
+
+    while true do
+        local ok, err = pcall(Step)
+        if not ok then
+            -- error sekarang dicatat, tidak lagi hilang tanpa jejak
+            print("[ERROR] Step: " .. tostring(err))
+            pcall(function() AddHistory("Error: " .. tostring(err)) end)
+            ExpectedWorld = ""
+            pcall(function() bot.auto_collect = false end)
+            if not BuildBlocked then SetBuild(build, true) end
+            Sleep(5000, 8000)
+        end
+    end
+end
+
+-- PERBAIKAN: jika Main crash (mis. error saat leveling), script
+-- otomatis dimulai ulang, tidak berhenti diam-diam.
+while true do
+    local ok, err = pcall(Main)
+    if not ok then
+        print("[FATAL] " .. tostring(err))
+        pcall(function() AddHistory("Fatal: " .. tostring(err)) end)
+    else
+        print("[INFO] Main berhenti, memulai ulang...")
+    end
+    ExpectedWorld = ""
+    Sleep(10000, 15000)
+end
